@@ -1,4 +1,5 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
+import { supabase } from "./supabaseClient";
 
 // =============================================================================
 // BASE DOUTRINARIA - DAMEPLAN CE 5.80 (2a Ed / 2025) + MC-5.60 (4a Ed / 2025)
@@ -1129,11 +1130,148 @@ export default function App() {
     codigoDesig: "", escalaoSolicitante: "", solicitante: "",
     utmStr: "", utmZona: "", utmHemi: "S", utmE: "", utmN: "", refUtm: "" };
 
-  var [meios, setMeios] = useState([Object.assign({}, meioI)]);
-  var [concs, setConcs] = useState([Object.assign({}, concI)]);
+  var [meios, setMeios] = useState([]);
+  var [concs, setConcs] = useState([]);
   var [resultado, setResultado] = useState(null);
   var [erro, setErro] = useState("");
   var [tab, setTab] = useState("entrada");
+  var [carregando, setCarregando] = useState(true);
+  var [syncStatus, setSyncStatus] = useState("conectando");
+
+  // Controle de edicao em andamento (evita sobrescrever o que a pessoa esta digitando)
+  var dirtyMeios = useRef(new Set());
+  var dirtyConcs = useRef(new Set());
+  var timersMeios = useRef({});
+  var timersConcs = useRef({});
+
+  function rowToItem(row) {
+    return Object.assign({ id: row.id }, row.dados || {});
+  }
+
+  // Carregamento inicial + sincronizacao em tempo real entre dispositivos (Supabase)
+  useEffect(function() {
+    var cancelado = false;
+
+    function carregarTudo() {
+      Promise.all([
+        supabase.from("meios").select("*").order("created_at", { ascending: true }),
+        supabase.from("concentracoes").select("*").order("created_at", { ascending: true })
+      ]).then(function(resultados) {
+        if (cancelado) return;
+        var rMeios = resultados[0];
+        var rConcs = resultados[1];
+
+        if (!rMeios.error && rMeios.data) {
+          setMeios(function(prevLocal) {
+            return rMeios.data.map(function(row) {
+              if (dirtyMeios.current.has(row.id)) {
+                var local = prevLocal.find(function(m) { return m.id === row.id; });
+                if (local) return local;
+              }
+              return rowToItem(row);
+            });
+          });
+        }
+        if (!rConcs.error && rConcs.data) {
+          setConcs(function(prevLocal) {
+            return rConcs.data.map(function(row) {
+              if (dirtyConcs.current.has(row.id)) {
+                var local = prevLocal.find(function(c) { return c.id === row.id; });
+                if (local) return local;
+              }
+              return rowToItem(row);
+            });
+          });
+        }
+        setCarregando(false);
+        setSyncStatus(rMeios.error || rConcs.error ? "erro" : "sincronizado");
+      }).catch(function() {
+        if (!cancelado) { setSyncStatus("erro"); setCarregando(false); }
+      });
+    }
+
+    carregarTudo();
+
+    var chMeios = supabase.channel("meios-sync")
+      .on("postgres_changes", { event: "*", schema: "public", table: "meios" }, function() {
+        carregarTudo();
+      })
+      .subscribe();
+
+    var chConcs = supabase.channel("concs-sync")
+      .on("postgres_changes", { event: "*", schema: "public", table: "concentracoes" }, function() {
+        carregarTudo();
+      })
+      .subscribe();
+
+    return function() {
+      cancelado = true;
+      supabase.removeChannel(chMeios);
+      supabase.removeChannel(chConcs);
+    };
+  }, []);
+
+  // --- Handlers de MEIOS (persistem no Supabase) ---
+  function addMeio() {
+    var novo = Object.assign({}, meioI);
+    supabase.from("meios").insert({ dados: novo }).select().single().then(function(res) {
+      if (res.data) {
+        setMeios(function(p) { return p.concat([Object.assign({ id: res.data.id }, novo)]); });
+      }
+    });
+  }
+
+  function removeMeio(id) {
+    setMeios(function(p) { return p.filter(function(x) { return x.id !== id; }); });
+    dirtyMeios.current.delete(id);
+    if (timersMeios.current[id]) clearTimeout(timersMeios.current[id]);
+    supabase.from("meios").delete().eq("id", id);
+  }
+
+  function updateMeio(id, novoObj) {
+    setMeios(function(p) { return p.map(function(x) { return x.id === id ? novoObj : x; }); });
+    dirtyMeios.current.add(id);
+    if (timersMeios.current[id]) clearTimeout(timersMeios.current[id]);
+    timersMeios.current[id] = setTimeout(function() {
+      var toSave = Object.assign({}, novoObj);
+      delete toSave.id;
+      supabase.from("meios").update({ dados: toSave, updated_at: new Date().toISOString() }).eq("id", id)
+        .then(function() {
+          setTimeout(function() { dirtyMeios.current.delete(id); }, 1200);
+        });
+    }, 700);
+  }
+
+  // --- Handlers de CONCENTRACOES (persistem no Supabase) ---
+  function addConc() {
+    var novo = Object.assign({}, concI);
+    supabase.from("concentracoes").insert({ dados: novo }).select().single().then(function(res) {
+      if (res.data) {
+        setConcs(function(p) { return p.concat([Object.assign({ id: res.data.id }, novo)]); });
+      }
+    });
+  }
+
+  function removeConc(id) {
+    setConcs(function(p) { return p.filter(function(x) { return x.id !== id; }); });
+    dirtyConcs.current.delete(id);
+    if (timersConcs.current[id]) clearTimeout(timersConcs.current[id]);
+    supabase.from("concentracoes").delete().eq("id", id);
+  }
+
+  function updateConc(id, novoObj) {
+    setConcs(function(p) { return p.map(function(x) { return x.id === id ? novoObj : x; }); });
+    dirtyConcs.current.add(id);
+    if (timersConcs.current[id]) clearTimeout(timersConcs.current[id]);
+    timersConcs.current[id] = setTimeout(function() {
+      var toSave = Object.assign({}, novoObj);
+      delete toSave.id;
+      supabase.from("concentracoes").update({ dados: toSave, updated_at: new Date().toISOString() }).eq("id", id)
+        .then(function() {
+          setTimeout(function() { dirtyConcs.current.delete(id); }, 1200);
+        });
+    }, 700);
+  }
 
   function resolvePosicao(item) {
     // --- POLAR (referencia UTM ou Geo) ---
@@ -1250,6 +1388,26 @@ export default function App() {
         <div style={{ fontSize: 11, color: "#6b7280", marginTop: 4 }}>
           MC-5.60 (4a Ed / 2025) - CE 5.80 DAMEPLAN (2a Ed / 2025) - EB / COTER
         </div>
+        <div style={{ marginTop: 8 }}>
+          {syncStatus === "sincronizado" && (
+            <span style={{ fontSize: 10, color: "#4ade80", background: "#0a1a0e",
+              border: "1px solid #15803d", borderRadius: 10, padding: "2px 10px" }}>
+              Sincronizado entre dispositivos
+            </span>
+          )}
+          {syncStatus === "conectando" && (
+            <span style={{ fontSize: 10, color: "#fbbf24", background: "#1f1a05",
+              border: "1px solid #92400e", borderRadius: 10, padding: "2px 10px" }}>
+              Conectando ao banco de dados...
+            </span>
+          )}
+          {syncStatus === "erro" && (
+            <span style={{ fontSize: 10, color: "#f87171", background: "#1c0a0a",
+              border: "1px solid #7f1d1d", borderRadius: 10, padding: "2px 10px" }}>
+              Erro de sincronizacao - verifique a configuracao do banco
+            </span>
+          )}
+        </div>
       </div>
 
       <div style={{ display: "flex", margin: "16px 0 0", borderBottom: "1px solid #374151" }}>
@@ -1262,37 +1420,45 @@ export default function App() {
 
         {tab === "entrada" && (
           <div>
-            <div style={{ fontSize: 14, fontWeight: 700, color: "#60a5fa", marginBottom: 12 }}>
-              1. MEIOS DE APOIO DE FOGO DISPONIVEIS
-            </div>
-            {meios.map(function(m, i) {
-              return (
-                <FormMeio key={i} idx={i} meio={m}
-                  onChange={function(v) { setMeios(function(p) { return p.map(function(x,j) { return j===i?v:x; }); }); }}
-                  onRemove={function() { setMeios(function(p) { return p.filter(function(_,j) { return j!==i; }); }); }} />
-              );
-            })}
-            <button onClick={function() { setMeios(function(p) { return p.concat([Object.assign({}, meioI)]); }); }}
-              style={{ background: "#1d4ed8", border: "none", color: "#fff", padding: "8px 20px",
-                borderRadius: 6, cursor: "pointer", fontWeight: 700, fontSize: 13, marginBottom: 24 }}>
-              + Adicionar meio
-            </button>
+            {carregando ? (
+              <div style={{ textAlign: "center", padding: 40, color: "#6b7280" }}>
+                Carregando dados sincronizados...
+              </div>
+            ) : (
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: "#60a5fa", marginBottom: 12 }}>
+                  1. MEIOS DE APOIO DE FOGO DISPONIVEIS
+                </div>
+                {meios.map(function(m, i) {
+                  return (
+                    <FormMeio key={m.id} idx={i} meio={m}
+                      onChange={function(v) { updateMeio(m.id, v); }}
+                      onRemove={function() { removeMeio(m.id); }} />
+                  );
+                })}
+                <button onClick={addMeio}
+                  style={{ background: "#1d4ed8", border: "none", color: "#fff", padding: "8px 20px",
+                    borderRadius: 6, cursor: "pointer", fontWeight: 700, fontSize: 13, marginBottom: 24 }}>
+                  + Adicionar meio
+                </button>
 
-            <div style={{ fontSize: 14, fontWeight: 700, color: "#34d399", marginBottom: 12 }}>
-              2. CONCENTRACOES (ALVOS)
-            </div>
-            {concs.map(function(c, i) {
-              return (
-                <FormConc key={i} idx={i} conc={c}
-                  onChange={function(v) { setConcs(function(p) { return p.map(function(x,j) { return j===i?v:x; }); }); }}
-                  onRemove={function() { setConcs(function(p) { return p.filter(function(_,j) { return j!==i; }); }); }} />
-              );
-            })}
-            <button onClick={function() { setConcs(function(p) { return p.concat([Object.assign({}, concI)]); }); }}
-              style={{ background: "#065f46", border: "none", color: "#fff", padding: "8px 20px",
-                borderRadius: 6, cursor: "pointer", fontWeight: 700, fontSize: 13, marginBottom: 24 }}>
-              + Adicionar concentracao
-            </button>
+                <div style={{ fontSize: 14, fontWeight: 700, color: "#34d399", marginBottom: 12 }}>
+                  2. CONCENTRACOES (ALVOS)
+                </div>
+                {concs.map(function(c, i) {
+                  return (
+                    <FormConc key={c.id} idx={i} conc={c}
+                      onChange={function(v) { updateConc(c.id, v); }}
+                      onRemove={function() { removeConc(c.id); }} />
+                  );
+                })}
+                <button onClick={addConc}
+                  style={{ background: "#065f46", border: "none", color: "#fff", padding: "8px 20px",
+                    borderRadius: 6, cursor: "pointer", fontWeight: 700, fontSize: 13, marginBottom: 24 }}>
+                  + Adicionar concentracao
+                </button>
+              </div>
+            )}
 
             {erro && (
               <div style={{ background: "#7f1d1d", padding: "10px 16px", borderRadius: 6,
