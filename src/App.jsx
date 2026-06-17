@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { supabase } from "./supabaseClient";
+import * as XLSX from "xlsx";
 
 // =============================================================================
 // BASE DOUTRINARIA - DAMEPLAN CE 5.80 (2a Ed / 2025) + MC-5.60 (4a Ed / 2025)
@@ -1211,6 +1212,239 @@ export default function App() {
     };
   }, []);
 
+  // ============================================================
+  // IMPORTACAO / EXPORTACAO POR PLANILHA (SheetJS)
+  // ============================================================
+  var [importStatus, setImportStatus] = useState("");
+  var inputMeioRef = useRef(null);
+  var inputConcRef = useRef(null);
+
+  function baixarModeloMeios() {
+    var linhas = [
+      {
+        nome: "GAC 105 - 1a Bia",
+        material: "Obus 105 mm AR",
+        escalaoLancador: "U",
+        unidade: "1o GAC",
+        utm: "23K 456789 7612345",
+        lat: "",
+        lon: ""
+      },
+      {
+        nome: "Pel Mrt P - 2a Cia",
+        material: "Mrt 120 mm",
+        escalaoLancador: "SU",
+        unidade: "2a Cia Fuz",
+        utm: "",
+        lat: -3.7219,
+        lon: -40.3505
+      }
+    ];
+    var ws = XLSX.utils.json_to_sheet(linhas);
+    ws["!cols"] = [{ wch: 22 }, { wch: 18 }, { wch: 16 }, { wch: 16 }, { wch: 22 }, { wch: 12 }, { wch: 12 }];
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Meios");
+
+    var materiaisDisp = Object.keys(MEIOS);
+    var wsRef = XLSX.utils.aoa_to_sheet([["MATERIAIS VALIDOS (copiar exatamente)"]].concat(materiaisDisp.map(function(m) { return [m]; })));
+    XLSX.utils.book_append_sheet(wb, wsRef, "Materiais validos");
+
+    var escRef = XLSX.utils.aoa_to_sheet([["ESCALOES VALIDOS"]].concat(ESCALOES.map(function(e) { return [e.sigla + " - " + e.nome]; })));
+    XLSX.utils.book_append_sheet(wb, escRef, "Escaloes validos");
+
+    XLSX.writeFile(wb, "modelo_meios.xlsx");
+  }
+
+  function baixarModeloConcs() {
+    var linhas = [
+      {
+        designacao: "PC Ini - 1a Cia",
+        efeito: "Neutralizacao",
+        codigoDesig: "BB 3202",
+        escalaoSolicitante: "U",
+        solicitante: "1o Btl",
+        utm: "23K 460000 7615000",
+        lat: "",
+        lon: "",
+        descricao: "Posto de comando avancado"
+      },
+      {
+        designacao: "Artilharia Ini",
+        efeito: "Destruicao",
+        codigoDesig: "BB 4105",
+        escalaoSolicitante: "SU",
+        solicitante: "3a Cia",
+        utm: "",
+        lat: -3.6800,
+        lon: -40.2500,
+        descricao: "Bateria em posicao"
+      }
+    ];
+    var ws = XLSX.utils.json_to_sheet(linhas);
+    ws["!cols"] = [{ wch: 20 }, { wch: 16 }, { wch: 14 }, { wch: 16 }, { wch: 14 }, { wch: 22 }, { wch: 12 }, { wch: 12 }, { wch: 28 }];
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Concentracoes");
+
+    var efeitosDisp = Object.keys(EFEITOS);
+    var wsRef = XLSX.utils.aoa_to_sheet([["EFEITOS VALIDOS (copiar exatamente)"]].concat(efeitosDisp.map(function(e) { return [e]; })));
+    XLSX.utils.book_append_sheet(wb, wsRef, "Efeitos validos");
+
+    var escRef = XLSX.utils.aoa_to_sheet([["ESCALOES VALIDOS"]].concat(ESCALOES.map(function(e) { return [e.sigla + " - " + e.nome]; })));
+    XLSX.utils.book_append_sheet(wb, escRef, "Escaloes validos");
+
+    XLSX.writeFile(wb, "modelo_concentracoes.xlsx");
+  }
+
+  function normalizarChaveExata(valor, listaChaves) {
+    if (!valor) return null;
+    var v = String(valor).trim();
+    // match exato
+    if (listaChaves.indexOf(v) !== -1) return v;
+    // match case-insensitive
+    var vLow = v.toLowerCase();
+    for (var i = 0; i < listaChaves.length; i++) {
+      if (listaChaves[i].toLowerCase() === vLow) return listaChaves[i];
+    }
+    return null;
+  }
+
+  function lerPlanilha(file) {
+    return new Promise(function(resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        try {
+          var data = new Uint8Array(e.target.result);
+          var wb = XLSX.read(data, { type: "array" });
+          var primeiraAba = wb.SheetNames[0];
+          var json = XLSX.utils.sheet_to_json(wb.Sheets[primeiraAba], { defval: "" });
+          resolve(json);
+        } catch (err) {
+          reject(err);
+        }
+      };
+      reader.onerror = function() { reject(new Error("Falha ao ler o arquivo")); };
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  function importarMeios(file) {
+    setImportStatus("Lendo planilha de meios...");
+    var materiaisValidos = Object.keys(MEIOS);
+    lerPlanilha(file).then(function(linhas) {
+      var validos = [];
+      var erros = [];
+
+      linhas.forEach(function(linha, idx) {
+        var numLinha = idx + 2; // +2 = cabecalho + 1-index
+        var nome = String(linha.nome || "").trim();
+        var materialBruto = String(linha.material || "").trim();
+        var material = normalizarChaveExata(materialBruto, materiaisValidos);
+
+        if (!nome) { erros.push("Linha " + numLinha + ": nome vazio"); return; }
+        if (!material) { erros.push("Linha " + numLinha + ": material invalido '" + materialBruto + "'"); return; }
+
+        var utm = String(linha.utm || "").trim();
+        var lat = linha.lat !== undefined && linha.lat !== "" ? String(linha.lat) : "";
+        var lon = linha.lon !== undefined && linha.lon !== "" ? String(linha.lon) : "";
+
+        if (!utm && (!lat || !lon)) {
+          erros.push("Linha " + numLinha + ": informe UTM ou Lat/Lon");
+          return;
+        }
+
+        validos.push(Object.assign({}, meioI, {
+          nome: nome,
+          material: material,
+          escalaoLancador: String(linha.escalaoLancador || "").trim(),
+          unidade: String(linha.unidade || "").trim(),
+          utmStr: utm,
+          lat: lat,
+          lon: lon
+        }));
+      });
+
+      if (validos.length === 0) {
+        setImportStatus("Nenhum meio valido encontrado. " + (erros.length ? erros.join(" | ") : ""));
+        return;
+      }
+
+      var payload = validos.map(function(v) { return { dados: v }; });
+      supabase.from("meios").insert(payload).select().then(function(res) {
+        if (res.error) {
+          setImportStatus("Erro ao gravar no banco: " + res.error.message);
+          return;
+        }
+        var novosItens = res.data.map(function(row) { return Object.assign({ id: row.id }, row.dados); });
+        setMeios(function(p) { return p.concat(novosItens); });
+        var msg = novosItens.length + " meio(s) importado(s) com sucesso.";
+        if (erros.length) msg += " " + erros.length + " linha(s) ignorada(s): " + erros.join(" | ");
+        setImportStatus(msg);
+      });
+    }).catch(function(err) {
+      setImportStatus("Erro ao processar arquivo: " + err.message);
+    });
+  }
+
+  function importarConcs(file) {
+    setImportStatus("Lendo planilha de concentracoes...");
+    var efeitosValidos = Object.keys(EFEITOS);
+    lerPlanilha(file).then(function(linhas) {
+      var validos = [];
+      var erros = [];
+
+      linhas.forEach(function(linha, idx) {
+        var numLinha = idx + 2;
+        var designacao = String(linha.designacao || "").trim();
+        var efeitoBruto = String(linha.efeito || "").trim();
+        var efeito = normalizarChaveExata(efeitoBruto, efeitosValidos);
+
+        if (!designacao) { erros.push("Linha " + numLinha + ": designacao vazia"); return; }
+        if (!efeito) { erros.push("Linha " + numLinha + ": efeito invalido '" + efeitoBruto + "'"); return; }
+
+        var utm = String(linha.utm || "").trim();
+        var lat = linha.lat !== undefined && linha.lat !== "" ? String(linha.lat) : "";
+        var lon = linha.lon !== undefined && linha.lon !== "" ? String(linha.lon) : "";
+
+        if (!utm && (!lat || !lon)) {
+          erros.push("Linha " + numLinha + ": informe UTM ou Lat/Lon");
+          return;
+        }
+
+        validos.push(Object.assign({}, concI, {
+          designacao: designacao,
+          efeito: efeito,
+          codigoDesig: String(linha.codigoDesig || "").trim(),
+          escalaoSolicitante: String(linha.escalaoSolicitante || "").trim(),
+          solicitante: String(linha.solicitante || "").trim(),
+          utmStr: utm,
+          lat: lat,
+          lon: lon,
+          descricao: String(linha.descricao || "").trim()
+        }));
+      });
+
+      if (validos.length === 0) {
+        setImportStatus("Nenhuma concentracao valida encontrada. " + (erros.length ? erros.join(" | ") : ""));
+        return;
+      }
+
+      var payload = validos.map(function(v) { return { dados: v }; });
+      supabase.from("concentracoes").insert(payload).select().then(function(res) {
+        if (res.error) {
+          setImportStatus("Erro ao gravar no banco: " + res.error.message);
+          return;
+        }
+        var novosItens = res.data.map(function(row) { return Object.assign({ id: row.id }, row.dados); });
+        setConcs(function(p) { return p.concat(novosItens); });
+        var msg = novosItens.length + " concentracao(oes) importada(s) com sucesso.";
+        if (erros.length) msg += " " + erros.length + " linha(s) ignorada(s): " + erros.join(" | ");
+        setImportStatus(msg);
+      });
+    }).catch(function(err) {
+      setImportStatus("Erro ao processar arquivo: " + err.message);
+    });
+  }
+
   // --- Handlers de MEIOS (persistem no Supabase) ---
   function addMeio() {
     var novo = Object.assign({}, meioI);
@@ -1438,6 +1672,81 @@ export default function App() {
               </div>
             ) : (
               <div>
+                {/* ===== IMPORTACAO POR PLANILHA ===== */}
+                <div style={{ border: "2px solid #a21caf", borderRadius: 8, background: "#111827",
+                  marginBottom: 20, overflow: "hidden" }}>
+                  <div style={{ background: "#a21caf", padding: "6px 14px", fontWeight: 700,
+                    fontSize: 13, color: "#fff", letterSpacing: 1 }}>
+                    IMPORTAR POR PLANILHA (.xlsx / .csv)
+                  </div>
+                  <div style={{ padding: 14 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+                      <div>
+                        <div style={{ fontSize: 12, fontWeight: 700, color: "#93c5fd", marginBottom: 6 }}>
+                          Meios de apoio de fogo
+                        </div>
+                        <button onClick={baixarModeloMeios}
+                          style={{ background: "#1f2937", border: "1px solid #374151", color: "#93c5fd",
+                            padding: "6px 12px", borderRadius: 5, cursor: "pointer", fontSize: 12,
+                            marginBottom: 8, width: "100%" }}>
+                          Baixar modelo (.xlsx)
+                        </button>
+                        <input ref={inputMeioRef} type="file" accept=".xlsx,.xls,.csv"
+                          style={{ display: "none" }}
+                          onChange={function(e) {
+                            if (e.target.files && e.target.files[0]) {
+                              importarMeios(e.target.files[0]);
+                              e.target.value = "";
+                            }
+                          }} />
+                        <button onClick={function() { inputMeioRef.current.click(); }}
+                          style={{ background: "#1d4ed8", border: "none", color: "#fff",
+                            padding: "6px 12px", borderRadius: 5, cursor: "pointer", fontSize: 12,
+                            fontWeight: 700, width: "100%" }}>
+                          Importar planilha de meios
+                        </button>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 12, fontWeight: 700, color: "#86efac", marginBottom: 6 }}>
+                          Concentracoes (alvos)
+                        </div>
+                        <button onClick={baixarModeloConcs}
+                          style={{ background: "#1f2937", border: "1px solid #374151", color: "#86efac",
+                            padding: "6px 12px", borderRadius: 5, cursor: "pointer", fontSize: 12,
+                            marginBottom: 8, width: "100%" }}>
+                          Baixar modelo (.xlsx)
+                        </button>
+                        <input ref={inputConcRef} type="file" accept=".xlsx,.xls,.csv"
+                          style={{ display: "none" }}
+                          onChange={function(e) {
+                            if (e.target.files && e.target.files[0]) {
+                              importarConcs(e.target.files[0]);
+                              e.target.value = "";
+                            }
+                          }} />
+                        <button onClick={function() { inputConcRef.current.click(); }}
+                          style={{ background: "#065f46", border: "none", color: "#fff",
+                            padding: "6px 12px", borderRadius: 5, cursor: "pointer", fontSize: 12,
+                            fontWeight: 700, width: "100%" }}>
+                          Importar planilha de concentracoes
+                        </button>
+                      </div>
+                    </div>
+                    {importStatus && (
+                      <div style={{ marginTop: 12, padding: "8px 12px", borderRadius: 5, fontSize: 12,
+                        background: importStatus.indexOf("Erro") === 0 || importStatus.indexOf("erro") !== -1 ? "#7f1d1d" : "#0a1a0e",
+                        color: importStatus.indexOf("Erro") === 0 ? "#fca5a5" : "#86efac",
+                        border: "1px solid " + (importStatus.indexOf("Erro") === 0 ? "#7f1d1d" : "#15803d") }}>
+                        {importStatus}
+                      </div>
+                    )}
+                    <div style={{ fontSize: 10, color: "#6b7280", marginTop: 8 }}>
+                      Baixe o modelo, preencha em Excel/Sheets/Numbers e importe de volta. Cada linha vira um registro.
+                      Preencha a coluna UTM ou as colunas Lat/Lon (nao precisa preencher as duas formas).
+                    </div>
+                  </div>
+                </div>
+
                 <div style={{ fontSize: 14, fontWeight: 700, color: "#60a5fa", marginBottom: 12 }}>
                   1. MEIOS DE APOIO DE FOGO DISPONIVEIS
                 </div>
