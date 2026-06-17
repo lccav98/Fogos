@@ -241,6 +241,59 @@ function municipaoRecomendada(material, efeito) {
 }
 
 // ============================================================
+// IMPORTACAO - RECONHECIMENTO DE PLANILHAS EM FORMATO ALTERNATIVO
+// (ex: planilhas de inteligencia/S2 com colunas Nome/Long/Lat/Natureza,
+// onde Long/Lat na verdade sao coordenadas UTM Leste/Norte)
+// ============================================================
+
+// Traducao do tipo de alvo (coluna Natureza) para descricao + efeito sugerido
+var NATUREZA_INFO = {
+  "bld":            { nome: "Blindado",                 efeito: "Neutralizacao" },
+  "blindado":       { nome: "Blindado",                  efeito: "Neutralizacao" },
+  "inf mec":        { nome: "Infantaria Mecanizada",      efeito: "Neutralizacao" },
+  "inf":            { nome: "Infantaria",                 efeito: "Neutralizacao" },
+  "po":             { nome: "Posto de Observacao",        efeito: "Neutralizacao" },
+  "posto observacao": { nome: "Posto de Observacao",      efeito: "Neutralizacao" },
+  "conc tropa":     { nome: "Concentracao de Tropa",      efeito: "Neutralizacao" },
+  "concentracao de tropa": { nome: "Concentracao de Tropa", efeito: "Neutralizacao" },
+  "posicao de art": { nome: "Posicao de Artilharia",      efeito: "Neutralizacao" },
+  "artilharia":     { nome: "Posicao de Artilharia",      efeito: "Neutralizacao" },
+  "pc":             { nome: "Posto de Comando",           efeito: "Neutralizacao" },
+  "log":            { nome: "Instalacao Logistica",       efeito: "Interdicao" },
+  "reserva":        { nome: "Reserva",                    efeito: "Inquietacao" }
+};
+
+// Remove acentos e normaliza para comparacao de texto
+function normalizarTexto(s) {
+  return String(s || "").trim().toLowerCase()
+    .replace(/[áàâãä]/g, "a").replace(/[éèêë]/g, "e").replace(/[íìîï]/g, "i")
+    .replace(/[óòôõö]/g, "o").replace(/[úùûü]/g, "u").replace(/ç/g, "c");
+}
+
+// Busca um campo na linha por varios nomes possiveis de coluna (case-insensitive)
+function getCampoCI(linha, candidatos) {
+  var chaves = Object.keys(linha);
+  for (var i = 0; i < candidatos.length; i++) {
+    for (var j = 0; j < chaves.length; j++) {
+      if (chaves[j].toLowerCase().trim() === candidatos[i]) return linha[chaves[j]];
+    }
+  }
+  return undefined;
+}
+
+// Detecta se a planilha esta no formato alternativo (Nome/Long/Lat/Natureza com UTM)
+function ehFormatoLegadoAlvos(linha) {
+  if (!linha) return false;
+  var chaves = Object.keys(linha).map(function(k) { return k.toLowerCase().trim(); });
+  var temNome = chaves.indexOf("nome") !== -1;
+  var temLong = chaves.indexOf("long") !== -1 || chaves.indexOf("easting") !== -1;
+  var temLat  = chaves.indexOf("lat") !== -1 || chaves.indexOf("northing") !== -1;
+  // So e "legado" se NAO tiver as colunas do nosso modelo padrao (designacao/efeito/utm)
+  var temPadrao = chaves.indexOf("designacao") !== -1 || chaves.indexOf("efeito") !== -1;
+  return temNome && temLong && temLat && !temPadrao;
+}
+
+// ============================================================
 // UTILITARIOS GEOGRAFICOS - UTM / GEO / POLAR
 // ============================================================
 
@@ -1216,6 +1269,8 @@ export default function App() {
   // IMPORTACAO / EXPORTACAO POR PLANILHA (SheetJS)
   // ============================================================
   var [importStatus, setImportStatus] = useState("");
+  var [zonaImportLegado, setZonaImportLegado] = useState("");
+  var [hemiImportLegado, setHemiImportLegado] = useState("S");
   var inputMeioRef = useRef(null);
   var inputConcRef = useRef(null);
 
@@ -1389,37 +1444,83 @@ export default function App() {
     setImportStatus("Lendo planilha de concentracoes...");
     var efeitosValidos = Object.keys(EFEITOS);
     lerPlanilha(file).then(function(linhas) {
+      if (linhas.length === 0) {
+        setImportStatus("Planilha vazia.");
+        return;
+      }
+
+      var legado = ehFormatoLegadoAlvos(linhas[0]);
+
+      if (legado && !zonaImportLegado.trim()) {
+        setImportStatus(
+          "Esta planilha usa coordenadas UTM (colunas Nome / Long / Lat / Natureza). " +
+          "Informe a Zona UTM no campo ao lado (ex: 21) antes de importar."
+        );
+        return;
+      }
+
       var validos = [];
       var erros = [];
 
       linhas.forEach(function(linha, idx) {
         var numLinha = idx + 2;
-        var designacao = String(linha.designacao || "").trim();
-        var efeitoBruto = String(linha.efeito || "").trim();
-        var efeito = normalizarChaveExata(efeitoBruto, efeitosValidos);
+        var designacao, codigoDesig, efeito, utm, lat, lon, descricao, escalaoSolicitante, solicitante;
 
-        if (!designacao) { erros.push("Linha " + numLinha + ": designacao vazia"); return; }
-        if (!efeito) { erros.push("Linha " + numLinha + ": efeito invalido '" + efeitoBruto + "'"); return; }
+        if (legado) {
+          // --- Formato alternativo: Nome / Long / Lat / Natureza (UTM E/N) ---
+          var nomeAlvo = String(getCampoCI(linha, ["nome"]) || "").trim();
+          var easting = getCampoCI(linha, ["long", "easting"]);
+          var northing = getCampoCI(linha, ["lat", "northing"]);
+          var naturezaBruta = String(getCampoCI(linha, ["natureza"]) || "").trim();
+          var infoNatureza = NATUREZA_INFO[normalizarTexto(naturezaBruta)];
 
-        var utm = String(linha.utm || "").trim();
-        var lat = linha.lat !== undefined && linha.lat !== "" ? String(linha.lat) : "";
-        var lon = linha.lon !== undefined && linha.lon !== "" ? String(linha.lon) : "";
+          if (!nomeAlvo) { erros.push("Linha " + numLinha + ": Nome vazio"); return; }
+          if (easting === undefined || northing === undefined || easting === "" || northing === "") {
+            erros.push("Linha " + numLinha + ": coordenadas UTM ausentes");
+            return;
+          }
 
-        if (!utm && (!lat || !lon)) {
-          erros.push("Linha " + numLinha + ": informe UTM ou Lat/Lon");
-          return;
+          designacao = nomeAlvo;
+          codigoDesig = nomeAlvo;
+          efeito = infoNatureza ? infoNatureza.efeito : "Neutralizacao";
+          utm = zonaImportLegado.trim() + " " + hemiImportLegado + " " + easting + " " + northing;
+          lat = ""; lon = "";
+          descricao = infoNatureza ? (infoNatureza.nome + " (" + naturezaBruta + ")") : naturezaBruta;
+          escalaoSolicitante = ""; solicitante = "";
+        } else {
+          // --- Formato padrao do modelo do sistema ---
+          designacao = String(linha.designacao || "").trim();
+          var efeitoBruto = String(linha.efeito || "").trim();
+          efeito = normalizarChaveExata(efeitoBruto, efeitosValidos);
+
+          if (!designacao) { erros.push("Linha " + numLinha + ": designacao vazia"); return; }
+          if (!efeito) { erros.push("Linha " + numLinha + ": efeito invalido '" + efeitoBruto + "'"); return; }
+
+          utm = String(linha.utm || "").trim();
+          lat = linha.lat !== undefined && linha.lat !== "" ? String(linha.lat) : "";
+          lon = linha.lon !== undefined && linha.lon !== "" ? String(linha.lon) : "";
+
+          if (!utm && (!lat || !lon)) {
+            erros.push("Linha " + numLinha + ": informe UTM ou Lat/Lon");
+            return;
+          }
+
+          codigoDesig = String(linha.codigoDesig || "").trim();
+          descricao = String(linha.descricao || "").trim();
+          escalaoSolicitante = String(linha.escalaoSolicitante || "").trim();
+          solicitante = String(linha.solicitante || "").trim();
         }
 
         validos.push(Object.assign({}, concI, {
           designacao: designacao,
           efeito: efeito,
-          codigoDesig: String(linha.codigoDesig || "").trim(),
-          escalaoSolicitante: String(linha.escalaoSolicitante || "").trim(),
-          solicitante: String(linha.solicitante || "").trim(),
+          codigoDesig: codigoDesig,
+          escalaoSolicitante: escalaoSolicitante,
+          solicitante: solicitante,
           utmStr: utm,
           lat: lat,
           lon: lon,
-          descricao: String(linha.descricao || "").trim()
+          descricao: descricao
         }));
       });
 
@@ -1436,7 +1537,8 @@ export default function App() {
         }
         var novosItens = res.data.map(function(row) { return Object.assign({ id: row.id }, row.dados); });
         setConcs(function(p) { return p.concat(novosItens); });
-        var msg = novosItens.length + " concentracao(oes) importada(s) com sucesso.";
+        var msg = novosItens.length + " concentracao(oes) importada(s) com sucesso" +
+          (legado ? " (formato UTM, zona " + zonaImportLegado.trim() + hemiImportLegado + ")." : ".");
         if (erros.length) msg += " " + erros.length + " linha(s) ignorada(s): " + erros.join(" | ");
         setImportStatus(msg);
       });
@@ -1730,6 +1832,28 @@ export default function App() {
                             fontWeight: 700, width: "100%" }}>
                           Importar planilha de concentracoes
                         </button>
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 8 }}>
+                          <div>
+                            <label style={{ fontSize: 9, color: "#6b7280" }}>Zona UTM (se planilha for Nome/Long/Lat)</label>
+                            <input type="text" value={zonaImportLegado}
+                              onChange={function(e) { setZonaImportLegado(e.target.value); }}
+                              placeholder="ex: 21"
+                              style={{ width: "100%", background: "#1f2937", border: "1px solid #374151",
+                                borderRadius: 4, padding: "4px 8px", color: "#f9fafb", fontSize: 12,
+                                boxSizing: "border-box" }} />
+                          </div>
+                          <div>
+                            <label style={{ fontSize: 9, color: "#6b7280" }}>Hemisferio</label>
+                            <select value={hemiImportLegado}
+                              onChange={function(e) { setHemiImportLegado(e.target.value); }}
+                              style={{ width: "100%", background: "#1f2937", border: "1px solid #374151",
+                                borderRadius: 4, padding: "4px 8px", color: "#f9fafb", fontSize: 12,
+                                boxSizing: "border-box" }}>
+                              <option value="S">Sul</option>
+                              <option value="N">Norte</option>
+                            </select>
+                          </div>
+                        </div>
                       </div>
                     </div>
                     {importStatus && (
@@ -1743,6 +1867,10 @@ export default function App() {
                     <div style={{ fontSize: 10, color: "#6b7280", marginTop: 8 }}>
                       Baixe o modelo, preencha em Excel/Sheets/Numbers e importe de volta. Cada linha vira um registro.
                       Preencha a coluna UTM ou as colunas Lat/Lon (nao precisa preencher as duas formas).
+                      <br/>
+                      <b style={{ color: "#a78bfa" }}>Formato alternativo aceito:</b> planilhas com colunas
+                      "Nome / Long / Lat / Natureza" (coordenadas UTM Leste/Norte, ex: planilhas de S2/Inteligencia)
+                      sao reconhecidas automaticamente - basta informar a Zona UTM ao lado.
                     </div>
                   </div>
                 </div>
