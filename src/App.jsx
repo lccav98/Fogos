@@ -1214,7 +1214,13 @@ export default function App() {
   // --- Handlers de MEIOS (persistem no Supabase) ---
   function addMeio() {
     var novo = Object.assign({}, meioI);
+    setErro("");
     supabase.from("meios").insert({ dados: novo }).select().single().then(function(res) {
+      if (res.error) {
+        setErro("Erro ao adicionar meio no banco: " + res.error.message +
+          " - verifique se a tabela 'meios' foi criada no Supabase (SQL Editor).");
+        return;
+      }
       if (res.data) {
         setMeios(function(p) { return p.concat([Object.assign({ id: res.data.id }, novo)]); });
       }
@@ -1245,7 +1251,13 @@ export default function App() {
   // --- Handlers de CONCENTRACOES (persistem no Supabase) ---
   function addConc() {
     var novo = Object.assign({}, concI);
+    setErro("");
     supabase.from("concentracoes").insert({ dados: novo }).select().single().then(function(res) {
+      if (res.error) {
+        setErro("Erro ao adicionar concentracao no banco: " + res.error.message +
+          " - verifique se a tabela 'concentracoes' foi criada no Supabase (SQL Editor).");
+        return;
+      }
       if (res.data) {
         setConcs(function(p) { return p.concat([Object.assign({ id: res.data.id }, novo)]); });
       }
