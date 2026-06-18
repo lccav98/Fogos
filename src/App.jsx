@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { supabase } from "./supabaseClient";
 import * as XLSX from "xlsx";
+import JSZip from "jszip";
 
 // =============================================================================
 // BASE DOUTRINARIA - DAMEPLAN CE 5.80 (2a Ed / 2025) + MC-5.60 (4a Ed / 2025)
@@ -203,9 +204,22 @@ const ESCALOES = [
 // Identificacao de quem lanca a concentracao (MC-5.60 Anexo B)
 function identificarLancador(designacao) {
   if (!designacao) return null;
-  var partes = designacao.trim().split(/\s+/);
-  var letras = partes[0] || "";
-  var numero = partes[1] ? parseInt(partes[1]) : NaN;
+  var str = designacao.trim();
+  var letras, numeroStr;
+
+  if (/\s/.test(str)) {
+    // Formato com espaco: "BB 3202"
+    var partes = str.split(/\s+/);
+    letras = partes[0] || "";
+    numeroStr = partes[1] || "";
+  } else {
+    // Formato sem espaco: "EN0002"
+    var m = str.match(/^([A-Za-z]+)(\d+)$/);
+    if (m) { letras = m[1]; numeroStr = m[2]; }
+    else { letras = str; numeroStr = ""; }
+  }
+
+  var numero = numeroStr ? parseInt(numeroStr, 10) : NaN;
   var resultado = { letras: letras, numero: numero, escalao: null, elemento: null, tipoMeio: null };
 
   // Identificar escalao pelo comprimento das letras
@@ -246,7 +260,7 @@ function municipaoRecomendada(material, efeito) {
 // onde Long/Lat na verdade sao coordenadas UTM Leste/Norte)
 // ============================================================
 
-// Traducao do tipo de alvo (coluna Natureza) para descricao + efeito sugerido
+// Traducao do tipo de alvo (coluna Natureza/Descricao) para descricao + efeito sugerido
 var NATUREZA_INFO = {
   "bld":            { nome: "Blindado",                 efeito: "Neutralizacao" },
   "blindado":       { nome: "Blindado",                  efeito: "Neutralizacao" },
@@ -260,7 +274,14 @@ var NATUREZA_INFO = {
   "artilharia":     { nome: "Posicao de Artilharia",      efeito: "Neutralizacao" },
   "pc":             { nome: "Posto de Comando",           efeito: "Neutralizacao" },
   "log":            { nome: "Instalacao Logistica",       efeito: "Interdicao" },
-  "reserva":        { nome: "Reserva",                    efeito: "Inquietacao" }
+  "reserva":        { nome: "Reserva",                    efeito: "Inquietacao" },
+  // Abreviaturas encontradas em listas de alvos (modelo Con/Descricao/Coordenadas)
+  "oa":             { nome: "Observador Avancado",        efeito: "Neutralizacao" },
+  "pdef":           { nome: "Posicao Defensiva",          efeito: "Neutralizacao" },
+  "cc ini":         { nome: "Posicao Inicial de Carros de Combate", efeito: "Neutralizacao" },
+  "at ini":         { nome: "Posicao Inicial Anti-Tanque", efeito: "Neutralizacao" },
+  "pos mrt":        { nome: "Posicao de Morteiro",        efeito: "Neutralizacao" },
+  "posmrt":         { nome: "Posicao de Morteiro",        efeito: "Neutralizacao" }
 };
 
 // Remove acentos e normaliza para comparacao de texto
@@ -270,12 +291,12 @@ function normalizarTexto(s) {
     .replace(/[óòôõö]/g, "o").replace(/[úùûü]/g, "u").replace(/ç/g, "c");
 }
 
-// Busca um campo na linha por varios nomes possiveis de coluna (case-insensitive)
+// Busca um campo na linha por varios nomes possiveis de coluna (case-insensitive, ignora acentos)
 function getCampoCI(linha, candidatos) {
   var chaves = Object.keys(linha);
   for (var i = 0; i < candidatos.length; i++) {
     for (var j = 0; j < chaves.length; j++) {
-      if (chaves[j].toLowerCase().trim() === candidatos[i]) return linha[chaves[j]];
+      if (normalizarTexto(chaves[j]) === candidatos[i]) return linha[chaves[j]];
     }
   }
   return undefined;
@@ -284,13 +305,30 @@ function getCampoCI(linha, candidatos) {
 // Detecta se a planilha esta no formato alternativo (Nome/Long/Lat/Natureza com UTM)
 function ehFormatoLegadoAlvos(linha) {
   if (!linha) return false;
-  var chaves = Object.keys(linha).map(function(k) { return k.toLowerCase().trim(); });
+  var chaves = Object.keys(linha).map(function(k) { return normalizarTexto(k); });
   var temNome = chaves.indexOf("nome") !== -1;
   var temLong = chaves.indexOf("long") !== -1 || chaves.indexOf("easting") !== -1;
   var temLat  = chaves.indexOf("lat") !== -1 || chaves.indexOf("northing") !== -1;
-  // So e "legado" se NAO tiver as colunas do nosso modelo padrao (designacao/efeito/utm)
   var temPadrao = chaves.indexOf("designacao") !== -1 || chaves.indexOf("efeito") !== -1;
   return temNome && temLong && temLat && !temPadrao;
+}
+
+// Detecta formato "LISTA DE ALVOS" (docx): Con / Descricao / Coordenadas / Dimensoes / Obs / Prep
+function ehFormatoListaAlvosDocx(linha) {
+  if (!linha) return false;
+  var chaves = Object.keys(linha).map(function(k) { return normalizarTexto(k); });
+  var temCon = chaves.indexOf("con") !== -1;
+  var temCoord = chaves.indexOf("coordenadas") !== -1;
+  return temCon && temCoord;
+}
+
+// Extrai E/N de string "585000-7095000" (aceita hifen normal ou en-dash)
+function parseCoordHifen(str) {
+  if (!str) return null;
+  var limpo = String(str).replace(/–/g, "-").replace(/\s+/g, "");
+  var m = limpo.match(/^(\d+)-(\d+)$/);
+  if (!m) return null;
+  return { e: m[1], n: m[2] };
 }
 
 // ============================================================
@@ -1271,6 +1309,7 @@ export default function App() {
   var [importStatus, setImportStatus] = useState("");
   var [zonaImportLegado, setZonaImportLegado] = useState("");
   var [hemiImportLegado, setHemiImportLegado] = useState("S");
+  var [materialImportOdt, setMaterialImportOdt] = useState("Obus 155 mm AP");
   var inputMeioRef = useRef(null);
   var inputConcRef = useRef(null);
 
@@ -1363,7 +1402,90 @@ export default function App() {
     return null;
   }
 
-  function lerPlanilha(file) {
+  // --- Leitores de arquivo: xlsx/xls/csv/ods via SheetJS; docx/odt via JSZip + DOMParser ---
+  function extrairGridDocx(arrayBuffer) {
+    return JSZip.loadAsync(arrayBuffer).then(function(zip) {
+      var arq = zip.file("word/document.xml");
+      if (!arq) return [];
+      return arq.async("string");
+    }).then(function(xmlStr) {
+      if (!xmlStr) return [];
+      var parser = new DOMParser();
+      var doc = parser.parseFromString(xmlStr, "application/xml");
+      var W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+      var tabelas = doc.getElementsByTagNameNS(W, "tbl");
+      if (tabelas.length === 0) return [];
+      var tbl = tabelas[0];
+      var linhas = tbl.getElementsByTagNameNS(W, "tr");
+      var grid = [];
+      for (var i = 0; i < linhas.length; i++) {
+        var celulasLinha = [];
+        var filhos = linhas[i].childNodes;
+        for (var c = 0; c < filhos.length; c++) {
+          var node = filhos[c];
+          if (node.nodeType === 1 && node.localName === "tc") {
+            var textos = node.getElementsByTagNameNS(W, "t");
+            var texto = "";
+            for (var t = 0; t < textos.length; t++) texto += textos[t].textContent;
+            celulasLinha.push(texto.trim());
+          }
+        }
+        grid.push(celulasLinha);
+      }
+      return grid;
+    });
+  }
+
+  function extrairGridOdt(arrayBuffer) {
+    return JSZip.loadAsync(arrayBuffer).then(function(zip) {
+      var arq = zip.file("content.xml");
+      if (!arq) return [];
+      return arq.async("string");
+    }).then(function(xmlStr) {
+      if (!xmlStr) return [];
+      var parser = new DOMParser();
+      var doc = parser.parseFromString(xmlStr, "application/xml");
+      var TABLE_NS = "urn:oasis:names:tc:opendocument:xmlns:table:1.0";
+      var TEXT_NS = "urn:oasis:names:tc:opendocument:xmlns:text:1.0";
+      var tabelas = doc.getElementsByTagNameNS(TABLE_NS, "table");
+      if (tabelas.length === 0) return [];
+      var tbl = tabelas[0];
+      var linhasNodes = tbl.getElementsByTagNameNS(TABLE_NS, "table-row");
+      var grid = [];
+      for (var i = 0; i < linhasNodes.length; i++) {
+        var celulasLinha = [];
+        var filhos = linhasNodes[i].childNodes;
+        for (var c = 0; c < filhos.length; c++) {
+          var node = filhos[c];
+          if (node.nodeType === 1 && node.localName === "table-cell") {
+            var repeatAttr = node.getAttribute("table:number-columns-repeated") ||
+              (node.getAttributeNS ? node.getAttributeNS(TABLE_NS, "number-columns-repeated") : null);
+            var repeticoes = repeatAttr ? parseInt(repeatAttr, 10) : 1;
+            var paragrafos = node.getElementsByTagNameNS(TEXT_NS, "p");
+            var texto = "";
+            for (var p = 0; p < paragrafos.length; p++) texto += paragrafos[p].textContent;
+            texto = texto.trim();
+            for (var r = 0; r < repeticoes; r++) celulasLinha.push(texto);
+          }
+        }
+        grid.push(celulasLinha);
+      }
+      return grid;
+    });
+  }
+
+  // Le qualquer arquivo suportado e retorna uma matriz (array de arrays) de celulas de texto
+  function lerArquivoComoMatriz(file) {
+    var nomeArq = (file.name || "").toLowerCase();
+
+    if (nomeArq.endsWith(".docx")) {
+      return file.arrayBuffer().then(extrairGridDocx);
+    }
+    if (nomeArq.endsWith(".odt")) {
+      return file.arrayBuffer().then(extrairGridOdt);
+    }
+
+    // xlsx / xls / csv / ods via SheetJS
     return new Promise(function(resolve, reject) {
       var reader = new FileReader();
       reader.onload = function(e) {
@@ -1371,8 +1493,8 @@ export default function App() {
           var data = new Uint8Array(e.target.result);
           var wb = XLSX.read(data, { type: "array" });
           var primeiraAba = wb.SheetNames[0];
-          var json = XLSX.utils.sheet_to_json(wb.Sheets[primeiraAba], { defval: "" });
-          resolve(json);
+          var grid = XLSX.utils.sheet_to_json(wb.Sheets[primeiraAba], { header: 1, defval: "", blankrows: false });
+          resolve(grid);
         } catch (err) {
           reject(err);
         }
@@ -1382,25 +1504,146 @@ export default function App() {
     });
   }
 
+  // Converte uma matriz (1a linha = cabecalhos) em objetos {cabecalho: valor}
+  function gridParaObjetos(grid) {
+    if (!grid || grid.length === 0) return [];
+    var headers = grid[0].map(function(h) { return String(h || "").trim(); });
+    return grid.slice(1).map(function(row) {
+      var obj = {};
+      headers.forEach(function(h, i) { obj[h] = row[i] !== undefined ? row[i] : ""; });
+      return obj;
+    });
+  }
+
+  // Detecta planilha-matriz de posicoes de artilharia (rotulos de linha tipo P1, P2, P3...)
+  function ehFormatoMatrizPosicoesArt(grid) {
+    if (!grid) return false;
+    var contagem = 0;
+    for (var i = 0; i < grid.length; i++) {
+      var primeiro = String((grid[i] && grid[i][0]) || "").trim();
+      if (/^p\d+$/i.test(primeiro)) contagem++;
+    }
+    return contagem >= 2;
+  }
+
+  // Extrai meios candidatos de uma planilha-matriz (varias posicoes alternativas por unidade)
+  function extrairMeiosDeMatrizPosicoes(grid, zona, hemi) {
+    var candidatos = [];
+    var headersAtuais = [];
+    var colunasArt = [];
+    var colunasIgnoradas = [];
+
+    function atualizarHeaders(row) {
+      headersAtuais = row.slice(1).map(function(h) { return String(h || "").trim(); });
+      colunasArt = [];
+      headersAtuais.forEach(function(h, idx) {
+        if (!h) return;
+        var hLow = normalizarTexto(h);
+        if (hLow.indexOf("gac") !== -1 || hLow.indexOf("bia") !== -1 ||
+            hLow.indexOf("btl") !== -1 || hLow.indexOf("pel") !== -1) {
+          colunasArt.push(idx);
+        } else if (colunasIgnoradas.indexOf(h) === -1) {
+          colunasIgnoradas.push(h);
+        }
+      });
+    }
+
+    for (var i = 0; i < grid.length; i++) {
+      var row = grid[i] || [];
+      var primeiro = String(row[0] || "").trim();
+      var restoVazio = row.slice(1).every(function(c) { return !String(c || "").trim(); });
+
+      if (!primeiro && !restoVazio) {
+        atualizarHeaders(row);
+        continue;
+      }
+      if (/^p\d+$/i.test(primeiro)) {
+        colunasArt.forEach(function(idx) {
+          var valor = String(row[idx + 1] || "").trim();
+          if (!valor) return;
+          var partes = valor.split(/-/);
+          if (partes.length !== 2 || !partes[0].trim() || !partes[1].trim()) return;
+          var unidade = headersAtuais[idx];
+          candidatos.push(Object.assign({}, meioI, {
+            nome: unidade + " - " + primeiro,
+            material: "",
+            escalaoLancador: "",
+            unidade: unidade,
+            utmStr: zona + " " + hemi + " " + partes[0].trim() + " " + partes[1].trim()
+          }));
+        });
+      }
+    }
+    return { candidatos: candidatos, colunasIgnoradas: colunasIgnoradas };
+  }
+
+  // ============================================================
+  // IMPORTAR MEIOS
+  // ============================================================
   function importarMeios(file) {
-    setImportStatus("Lendo planilha de meios...");
+    setImportStatus("Lendo arquivo de meios...");
     var materiaisValidos = Object.keys(MEIOS);
-    lerPlanilha(file).then(function(linhas) {
+
+    lerArquivoComoMatriz(file).then(function(grid) {
+      if (!grid || grid.length === 0) {
+        setImportStatus("Arquivo vazio ou nenhuma tabela encontrada.");
+        return;
+      }
+
+      // --- Formato matriz: posicoes alternativas de baterias/grupos (P1, P2, P3...) ---
+      if (ehFormatoMatrizPosicoesArt(grid)) {
+        if (!zonaImportLegado.trim()) {
+          setImportStatus(
+            "Esta planilha usa coordenadas UTM em matriz de posicoes (P1, P2, P3...). " +
+            "Informe a Zona UTM no campo ao lado antes de importar."
+          );
+          return;
+        }
+        var resultadoMatriz = extrairMeiosDeMatrizPosicoes(grid, zonaImportLegado.trim(), hemiImportLegado);
+        if (resultadoMatriz.candidatos.length === 0) {
+          setImportStatus("Nenhuma posicao de artilharia reconhecida nesta planilha.");
+          return;
+        }
+        var payloadMatriz = resultadoMatriz.candidatos.map(function(v) { return { dados: v }; });
+        supabase.from("meios").insert(payloadMatriz).select().then(function(res) {
+          if (res.error) {
+            setImportStatus("Erro ao gravar no banco: " + res.error.message);
+            return;
+          }
+          var novosItens = res.data.map(function(row) { return Object.assign({ id: row.id }, row.dados); });
+          setMeios(function(p) { return p.concat(novosItens); });
+          var msg = novosItens.length + " posicao(oes) de artilharia importada(s) " +
+            "(zona " + zonaImportLegado.trim() + hemiImportLegado + "). " +
+            "ATENCAO: o MATERIAL nao foi definido automaticamente - edite cada meio e selecione " +
+            "o material correto antes de calcular o plano de fogos.";
+          if (resultadoMatriz.colunasIgnoradas.length) {
+            msg += " Colunas ignoradas (nao identificadas como unidade de tiro): " +
+              resultadoMatriz.colunasIgnoradas.join(", ") + ".";
+          }
+          setImportStatus(msg);
+        });
+        return;
+      }
+
+      // --- Formato padrao: nome / material / utm (ou lat/lon) ---
+      var objetos = gridParaObjetos(grid);
       var validos = [];
       var erros = [];
 
-      linhas.forEach(function(linha, idx) {
-        var numLinha = idx + 2; // +2 = cabecalho + 1-index
-        var nome = String(linha.nome || "").trim();
-        var materialBruto = String(linha.material || "").trim();
+      objetos.forEach(function(linha, idx) {
+        var numLinha = idx + 2;
+        var nome = String(getCampoCI(linha, ["nome"]) || "").trim();
+        var materialBruto = String(getCampoCI(linha, ["material"]) || "").trim();
         var material = normalizarChaveExata(materialBruto, materiaisValidos);
 
         if (!nome) { erros.push("Linha " + numLinha + ": nome vazio"); return; }
         if (!material) { erros.push("Linha " + numLinha + ": material invalido '" + materialBruto + "'"); return; }
 
-        var utm = String(linha.utm || "").trim();
-        var lat = linha.lat !== undefined && linha.lat !== "" ? String(linha.lat) : "";
-        var lon = linha.lon !== undefined && linha.lon !== "" ? String(linha.lon) : "";
+        var utm = String(getCampoCI(linha, ["utm"]) || "").trim();
+        var latV = getCampoCI(linha, ["lat"]);
+        var lonV = getCampoCI(linha, ["lon"]);
+        var lat = (latV !== undefined && latV !== "") ? String(latV) : "";
+        var lon = (lonV !== undefined && lonV !== "") ? String(lonV) : "";
 
         if (!utm && (!lat || !lon)) {
           erros.push("Linha " + numLinha + ": informe UTM ou Lat/Lon");
@@ -1410,8 +1653,8 @@ export default function App() {
         validos.push(Object.assign({}, meioI, {
           nome: nome,
           material: material,
-          escalaoLancador: String(linha.escalaoLancador || "").trim(),
-          unidade: String(linha.unidade || "").trim(),
+          escalaoLancador: String(getCampoCI(linha, ["escalaolancador"]) || "").trim(),
+          unidade: String(getCampoCI(linha, ["unidade"]) || "").trim(),
           utmStr: utm,
           lat: lat,
           lon: lon
@@ -1440,21 +1683,38 @@ export default function App() {
     });
   }
 
+  // ============================================================
+  // IMPORTAR CONCENTRACOES
+  // ============================================================
   function importarConcs(file) {
-    setImportStatus("Lendo planilha de concentracoes...");
+    setImportStatus("Lendo arquivo de concentracoes...");
     var efeitosValidos = Object.keys(EFEITOS);
-    lerPlanilha(file).then(function(linhas) {
-      if (linhas.length === 0) {
-        setImportStatus("Planilha vazia.");
+
+    lerArquivoComoMatriz(file).then(function(grid) {
+      if (!grid || grid.length === 0) {
+        setImportStatus("Arquivo vazio ou nenhuma tabela encontrada.");
         return;
       }
 
-      var legado = ehFormatoLegadoAlvos(linhas[0]);
+      var objetos = gridParaObjetos(grid);
+      if (objetos.length === 0) {
+        setImportStatus("Nenhuma linha de dados encontrada.");
+        return;
+      }
 
-      if (legado && !zonaImportLegado.trim()) {
+      var primeiraLinha = objetos[0];
+      var headersNorm = Object.keys(primeiraLinha).map(function(k) { return normalizarTexto(k); });
+
+      var temListaAlvos = headersNorm.indexOf("con") !== -1 && headersNorm.indexOf("coordenadas") !== -1;
+      var legadoNomeLongLat = !temListaAlvos && ehFormatoLegadoAlvos(primeiraLinha);
+
+      var formato = temListaAlvos ? "listaAlvos" : (legadoNomeLongLat ? "nomeLongLat" : "padrao");
+
+      if (formato !== "padrao" && !zonaImportLegado.trim()) {
         setImportStatus(
-          "Esta planilha usa coordenadas UTM (colunas Nome / Long / Lat / Natureza). " +
-          "Informe a Zona UTM no campo ao lado (ex: 21) antes de importar."
+          "Esta planilha usa coordenadas UTM (" +
+          (formato === "listaAlvos" ? "colunas Con / Coordenadas" : "colunas Nome / Long / Lat") +
+          "). Informe a Zona UTM no campo ao lado antes de importar."
         );
         return;
       }
@@ -1462,11 +1722,45 @@ export default function App() {
       var validos = [];
       var erros = [];
 
-      linhas.forEach(function(linha, idx) {
+      objetos.forEach(function(linha, idx) {
         var numLinha = idx + 2;
         var designacao, codigoDesig, efeito, utm, lat, lon, descricao, escalaoSolicitante, solicitante;
 
-        if (legado) {
+        if (formato === "listaAlvos") {
+          // --- Formato: Con / Descricao / Coordenadas / Dimensoes / Obs / Prep ---
+          var con = String(getCampoCI(linha, ["con"]) || "").trim();
+          var coordBruta = String(getCampoCI(linha, ["coordenadas"]) || "").trim();
+          var descBruta = String(getCampoCI(linha, ["descricao"]) || "").trim();
+          var dimensoes = String(getCampoCI(linha, ["dimensoes"]) || "").trim();
+          var obsBruta = String(getCampoCI(linha, ["obs"]) || "").trim();
+          var prepBruta = String(getCampoCI(linha, ["prep"]) || "").trim();
+
+          if (!con) { erros.push("Linha " + numLinha + ": Con vazio"); return; }
+
+          var partesCoordLA = coordBruta.split(/-/);
+          if (partesCoordLA.length !== 2 || !partesCoordLA[0].trim() || !partesCoordLA[1].trim()) {
+            erros.push("Linha " + numLinha + ": coordenadas invalidas '" + coordBruta + "'");
+            return;
+          }
+
+          var infoNat = NATUREZA_INFO[normalizarTexto(descBruta)];
+          efeito = infoNat ? infoNat.efeito : "Neutralizacao";
+          if (/fum/i.test(obsBruta)) efeito = "Fumigena";
+
+          var partesDesc = [infoNat && infoNat.nome ? infoNat.nome : (descBruta || "Alvo")];
+          if (dimensoes) partesDesc.push("Dim: " + dimensoes + "m");
+          if (obsBruta) partesDesc.push("Obs: " + obsBruta);
+          if (prepBruta) partesDesc.push("Prep: " + (prepBruta.toUpperCase() === "X" ? "Sim" : "Nao"));
+
+          designacao = con;
+          codigoDesig = con;
+          utm = zonaImportLegado.trim() + " " + hemiImportLegado + " " +
+            partesCoordLA[0].trim() + " " + partesCoordLA[1].trim();
+          lat = ""; lon = "";
+          descricao = partesDesc.join(" | ");
+          escalaoSolicitante = ""; solicitante = "";
+
+        } else if (formato === "nomeLongLat") {
           // --- Formato alternativo: Nome / Long / Lat / Natureza (UTM E/N) ---
           var nomeAlvo = String(getCampoCI(linha, ["nome"]) || "").trim();
           var easting = getCampoCI(linha, ["long", "easting"]);
@@ -1485,30 +1779,33 @@ export default function App() {
           efeito = infoNatureza ? infoNatureza.efeito : "Neutralizacao";
           utm = zonaImportLegado.trim() + " " + hemiImportLegado + " " + easting + " " + northing;
           lat = ""; lon = "";
-          descricao = infoNatureza ? (infoNatureza.nome + " (" + naturezaBruta + ")") : naturezaBruta;
+          descricao = infoNatureza && infoNatureza.nome ? (infoNatureza.nome + " (" + naturezaBruta + ")") : naturezaBruta;
           escalaoSolicitante = ""; solicitante = "";
+
         } else {
           // --- Formato padrao do modelo do sistema ---
-          designacao = String(linha.designacao || "").trim();
-          var efeitoBruto = String(linha.efeito || "").trim();
+          designacao = String(getCampoCI(linha, ["designacao"]) || "").trim();
+          var efeitoBruto = String(getCampoCI(linha, ["efeito"]) || "").trim();
           efeito = normalizarChaveExata(efeitoBruto, efeitosValidos);
 
           if (!designacao) { erros.push("Linha " + numLinha + ": designacao vazia"); return; }
           if (!efeito) { erros.push("Linha " + numLinha + ": efeito invalido '" + efeitoBruto + "'"); return; }
 
-          utm = String(linha.utm || "").trim();
-          lat = linha.lat !== undefined && linha.lat !== "" ? String(linha.lat) : "";
-          lon = linha.lon !== undefined && linha.lon !== "" ? String(linha.lon) : "";
+          utm = String(getCampoCI(linha, ["utm"]) || "").trim();
+          var latP = getCampoCI(linha, ["lat"]);
+          var lonP = getCampoCI(linha, ["lon"]);
+          lat = (latP !== undefined && latP !== "") ? String(latP) : "";
+          lon = (lonP !== undefined && lonP !== "") ? String(lonP) : "";
 
           if (!utm && (!lat || !lon)) {
             erros.push("Linha " + numLinha + ": informe UTM ou Lat/Lon");
             return;
           }
 
-          codigoDesig = String(linha.codigoDesig || "").trim();
-          descricao = String(linha.descricao || "").trim();
-          escalaoSolicitante = String(linha.escalaoSolicitante || "").trim();
-          solicitante = String(linha.solicitante || "").trim();
+          codigoDesig = String(getCampoCI(linha, ["codigodesig"]) || "").trim();
+          descricao = String(getCampoCI(linha, ["descricao"]) || "").trim();
+          escalaoSolicitante = String(getCampoCI(linha, ["escalaosolicitante"]) || "").trim();
+          solicitante = String(getCampoCI(linha, ["solicitante"]) || "").trim();
         }
 
         validos.push(Object.assign({}, concI, {
@@ -1538,7 +1835,7 @@ export default function App() {
         var novosItens = res.data.map(function(row) { return Object.assign({ id: row.id }, row.dados); });
         setConcs(function(p) { return p.concat(novosItens); });
         var msg = novosItens.length + " concentracao(oes) importada(s) com sucesso" +
-          (legado ? " (formato UTM, zona " + zonaImportLegado.trim() + hemiImportLegado + ")." : ".");
+          (formato !== "padrao" ? " (formato UTM, zona " + zonaImportLegado.trim() + hemiImportLegado + ")." : ".");
         if (erros.length) msg += " " + erros.length + " linha(s) ignorada(s): " + erros.join(" | ");
         setImportStatus(msg);
       });
@@ -1793,7 +2090,7 @@ export default function App() {
                             marginBottom: 8, width: "100%" }}>
                           Baixar modelo (.xlsx)
                         </button>
-                        <input ref={inputMeioRef} type="file" accept=".xlsx,.xls,.csv"
+                        <input ref={inputMeioRef} type="file" accept=".xlsx,.xls,.csv,.ods,.docx,.odt"
                           style={{ display: "none" }}
                           onChange={function(e) {
                             if (e.target.files && e.target.files[0]) {
@@ -1818,7 +2115,7 @@ export default function App() {
                             marginBottom: 8, width: "100%" }}>
                           Baixar modelo (.xlsx)
                         </button>
-                        <input ref={inputConcRef} type="file" accept=".xlsx,.xls,.csv"
+                        <input ref={inputConcRef} type="file" accept=".xlsx,.xls,.csv,.ods,.docx,.odt"
                           style={{ display: "none" }}
                           onChange={function(e) {
                             if (e.target.files && e.target.files[0]) {
@@ -1834,10 +2131,10 @@ export default function App() {
                         </button>
                         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 8 }}>
                           <div>
-                            <label style={{ fontSize: 9, color: "#6b7280" }}>Zona UTM (se planilha for Nome/Long/Lat)</label>
+                            <label style={{ fontSize: 9, color: "#6b7280" }}>Zona UTM (se planilha usar coord. UTM)</label>
                             <input type="text" value={zonaImportLegado}
                               onChange={function(e) { setZonaImportLegado(e.target.value); }}
-                              placeholder="ex: 21"
+                              placeholder="ex: 22"
                               style={{ width: "100%", background: "#1f2937", border: "1px solid #374151",
                                 borderRadius: 4, padding: "4px 8px", color: "#f9fafb", fontSize: 12,
                                 boxSizing: "border-box" }} />
@@ -1867,10 +2164,19 @@ export default function App() {
                     <div style={{ fontSize: 10, color: "#6b7280", marginTop: 8 }}>
                       Baixe o modelo, preencha em Excel/Sheets/Numbers e importe de volta. Cada linha vira um registro.
                       Preencha a coluna UTM ou as colunas Lat/Lon (nao precisa preencher as duas formas).
+                      <br/><br/>
+                      <b style={{ color: "#a78bfa" }}>Formatos alternativos reconhecidos automaticamente</b> (alem do
+                      modelo padrao .xlsx) - aceita .xlsx, .ods, .csv, <b>.docx e .odt direto</b> (sem precisar converter):
                       <br/>
-                      <b style={{ color: "#a78bfa" }}>Formato alternativo aceito:</b> planilhas com colunas
-                      "Nome / Long / Lat / Natureza" (coordenadas UTM Leste/Norte, ex: planilhas de S2/Inteligencia)
-                      sao reconhecidas automaticamente - basta informar a Zona UTM ao lado.
+                      &bull; <b>Concentracoes:</b> "Con / Descricao / Coordenadas / Dimensoes / Obs / Prep" (lista de
+                      alvos no padrao de planejamento, coordenadas tipo "585000-7095000")
+                      <br/>
+                      &bull; <b>Concentracoes:</b> "Nome / Long / Lat / Natureza" (planilhas de S2/Inteligencia, UTM E/N)
+                      <br/>
+                      &bull; <b>Meios:</b> tabela-matriz de posicoes (colunas = baterias/grupos, linhas = P1, P2, P3...
+                      com coordenadas alternativas) - material precisa ser definido manualmente apos a importacao
+                      <br/>
+                      Em todos os casos com UTM, informe a Zona UTM e o Hemisferio antes de importar.
                     </div>
                   </div>
                 </div>
